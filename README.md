@@ -4,7 +4,8 @@
 
 - OpenGL
 - OpenCL (`cl_khr_gl_sharing` extension required)
-- GLUI
+- GLUI (https://github.com/libglui/glui) 
+    - `install_third_party.sh` should take care of this for you. See: **Building**.
 - GLUT
 - OpenMP (will remove dependency)
 
