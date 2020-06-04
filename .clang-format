@@ -1,0 +1,8 @@
+BasedOnStyle: Google
+IndentWidth: 4
+AccessModifierOffset: -2
+ColumnLimit: 65
+DerivePointerBinding: false
+PointerBindsToType: false
+BinPackParameters: false
+AllowShortIfStatementsOnASingleLine: false
