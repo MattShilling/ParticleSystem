@@ -22,6 +22,9 @@
 // OpenCL includes.
 #include <CL/cl.h>
 #include <CL/cl_gl.h>
+#include "cudaGL.h"
+#include "cuda_gl_interop.h"
+#include <cuda_runtime_api.h>
 
 #include "cl_rig.h"
 
@@ -48,8 +51,14 @@ const float ZMAX = {100.0};
 const float VMIN = {-100.};
 const float VMAX = {100.};
 
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 32 // number of threads per block
+#endif
+
 const int NUM_PARTICLES = 1024 * 1024;
-const int LOCAL_SIZE = 64;
+
+#define NUM_BLOCKS (NUM_PARTICLES / BLOCK_SIZE)
+
 const char *CL_FILE_NAME = {"particles.cl"};
 const char *CL_BINARY_NAME = {"particles.nv"};
 
@@ -105,13 +114,13 @@ float TransXYZ[3];    // set by glui translation widgets
 double ElapsedTime;
 int ShowPerformance;
 
-size_t GlobalWorkSize[3] = {NUM_PARTICLES, 1, 1};
-size_t LocalWorkSize[3] = {LOCAL_SIZE, 1, 1};
+dim3 threads(BLOCK_SIZE, 1, 1);
+dim3 grid(NUM_BLOCKS, 1, 1);
 
 GLuint hPobj;
 GLuint hCobj;
-cl_mem dPobj;
-cl_mem dCobj;
+cudaGraphicsResource_t dPobj;
+cudaGraphicsResource_t dCobj;
 struct xyzw *hVel;
 cl_mem dVel;
 cl_command_queue CmdQueue;
@@ -120,6 +129,8 @@ cl_kernel Kernel;
 cl_platform_id Platform;
 cl_program Program;
 cl_platform_id PlatformID;
+
+// cudaGraphicsResource_t interop_buf_handle;
 
 // Function prototypes.
 inline float SQR(float x) { return x * x; }
@@ -148,8 +159,30 @@ void SelectOpenclDevice();
 void Traces(int);
 void Visibility(int);
 
+#define GL_CHECK_ERROR() \
+    do { \
+        GLenum err; \
+        err = glGetError(); \
+        if(err != GL_NO_ERROR) \
+        { \
+            fprintf(stderr, "%s:%d GL error: %s\n", __FILE__, __LINE__, gluErrorString(err)); \
+            exit(1); \
+        } \
+    } while (0)
+
+#define CUDA_CHECK_ERROR() \
+    do { \
+        cudaError err = cudaGetLastError(); \
+        if (cudaSuccess != err) { \
+            fprintf(stderr, "Cuda error in file '%s' in line %i : %s.\n", __FILE__, __LINE__, cudaGetErrorString(err) ); \
+            exit(1); \
+        } \
+    } while(0) 
+
 // Main Program.
 int main(int argc, char *argv[]) {
+    printf("%d\n\n\n", glXGetCurrentContext());
+    printf("%d\n\n\n", glXGetCurrentDisplay());
     glutInit(&argc, argv);
     InitGraphics();
     InitLists();
@@ -179,11 +212,12 @@ void Animate() {
         time0 = omp_get_wtime();
 
     // Enqueue the Kernel object for execution.
-    cl_event wait;
-    status = clEnqueueNDRangeKernel(
-        CmdQueue, Kernel, 1, NULL, GlobalWorkSize, LocalWorkSize,
-        0, NULL, &wait);
-    PrintCLError(status, "clEnqueueNDRangeKernel: ");
+    // cl_event wait;
+    // status = clEnqueueNDRangeKernel(
+    //     CmdQueue, Kernel, 1, NULL, GlobalWorkSize, LocalWorkSize,
+    //     0, NULL, &wait);
+    // PrintCLError(status, "clEnqueueNDRangeKernel: ");
+    Kernel<<<grid, threads>>>(/** memory **/);
 
     if (ShowPerformance) {
         status = clWaitForEvents(1, &wait);
@@ -192,13 +226,16 @@ void Animate() {
         ElapsedTime = time1 - time0;
     }
 
-    clFinish(CmdQueue);
-    status = clEnqueueReleaseGLObjects(CmdQueue, 1, &dCobj, 0,
-                                       NULL, NULL);
-    PrintCLError(status, "clEnqueueReleaseGLObjects (2): ");
-    status = clEnqueueReleaseGLObjects(CmdQueue, 1, &dPobj, 0,
-                                       NULL, NULL);
-    PrintCLError(status, "clEnqueueReleaseGLObjects (2): ");
+    cudaGraphicsUnregisterResource(dPobj);
+    cudaGraphicsUnregisterResource(dCobj);
+
+    // clFinish(CmdQueue);
+    // status = clEnqueueReleaseGLObjects(CmdQueue, 1, &dCobj, 0,
+    //                                    NULL, NULL);
+    // PrintCLError(status, "clEnqueueReleaseGLObjects (2): ");
+    // status = clEnqueueReleaseGLObjects(CmdQueue, 1, &dPobj, 0,
+    //                                    NULL, NULL);
+    // PrintCLError(status, "clEnqueueReleaseGLObjects (2): ");
 
     glutSetWindow(MainWindow);
     glutPostRedisplay();
@@ -396,24 +433,16 @@ bool InitCL() {
         return false;
     }
 
-    // Create an OpenCL context based on the OpenGL context.
-    cl_context_properties props[] = {
-        CL_GL_CONTEXT_KHR,
-        (cl_context_properties)glXGetCurrentContext(),
-        CL_WGL_HDC_KHR,
-        (cl_context_properties)glXGetCurrentDisplay(),
-        CL_CONTEXT_PLATFORM,
-        (cl_context_properties)Platform,
-        0};
+    unsigned int glDeviceCount = 2;
+    int glDevices[2];
 
-    cl_context Context =
-        clCreateContext(props, 1, &Device, NULL, NULL, &status);
-    PrintCLError(status, "clCreateContext: ");
-
-    // Create an OpenCL command queue.
-    CmdQueue = clCreateCommandQueue(Context, Device, 0, &status);
-    if (status != CL_SUCCESS)
-        fprintf(stderr, "clCreateCommandQueue failed\n");
+    // Print all devices that are spanned by the current GL context.
+    cudaGLGetDevices(&glDeviceCount, glDevices, glDeviceCount, cudaGLDeviceListAll);
+    CUDA_CHECK_ERROR();
+    printf("OpenGL is using CUDA device(s): ");
+    for (unsigned int i = 0; i < glDeviceCount; ++i) {
+        printf("%s%d", i == 0 ? "" : ", ", glDevices[i]);
+    }
 
     // Create the velocity array and the OpenGL vertex array
     // buffer and color array buffer.
@@ -437,78 +466,38 @@ bool InitCL() {
     // Fill those arrays and buffers.
     ResetParticles();
 
-    // Create the OpenCL version of the OpenGL buffers.
-    dPobj = clCreateFromGLBuffer(Context, CL_MEM_READ_WRITE,
-                                 hPobj, &status);
-    PrintCLError(status, "clCreateFromGLBuffer (1)");
 
-    dCobj = clCreateFromGLBuffer(Context, CL_MEM_READ_WRITE,
-                                 hCobj, &status);
-    PrintCLError(status, "clCreateFromGLBuffer (2)");
+
+    // Create the OpenCL version of the OpenGL buffers.
+    cudaGraphicsGLRegisterBuffer(&dPobj, hPobj, cudaGraphicsRegisterFlagsNone);
+    CUDA_CHECK_ERROR();
+
+    // dPobj = clCreateFromGLBuffer(Context, CL_MEM_READ_WRITE,
+    //                              hPobj, &status);
+    // PrintCLError(status, "clCreateFromGLBuffer (1)");
+
+    cudaGraphicsGLRegisterBuffer(&dCobj, hCobj, cudaGraphicsRegisterFlagsNone);
+    CUDA_CHECK_ERROR();
+
+    // dCobj = clCreateFromGLBuffer(Context, CL_MEM_READ_WRITE,
+    //                              hCobj, &status);
+    // PrintCLError(status, "clCreateFromGLBuffer (2)");
 
     // Create the OpenCL version of the velocity array.
+    
+    CudaRig::InitAndCopy(dVel, hVel, 4 * sizeof(float) * NUM_PARTICLES);
+    CUDA_CHECK_ERROR();
+    // dVel = clCreateBuffer(Context, CL_MEM_READ_WRITE,
+    //                       4 * sizeof(float) * NUM_PARTICLES,
+    //                       NULL, &status);
+    // PrintCLError(status, "clCreateBuffer: ");
 
-    dVel = clCreateBuffer(Context, CL_MEM_READ_WRITE,
-                          4 * sizeof(float) * NUM_PARTICLES,
-                          NULL, &status);
-    PrintCLError(status, "clCreateBuffer: ");
-
-    // Enqueue the command to write the data from the host
-    // buffers to the Device buffers.
-    status = clEnqueueWriteBuffer(
-        CmdQueue, dVel, CL_FALSE, 0,
-        4 * sizeof(float) * NUM_PARTICLES, hVel, 0, NULL, NULL);
-    PrintCLError(status, "clEneueueWriteBuffer: ");
-
-    // Read the Kernel code from a file.
-    fseek(fp, 0, SEEK_END);
-    size_t fileSize = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    char *clProgramText =
-        new char[fileSize + 1];  // leave room for '\0'
-    size_t n = fread(clProgramText, 1, fileSize, fp);
-    clProgramText[fileSize] = '\0';
-    fclose(fp);
-
-    // Create the text for the Kernel Program.
-    char *strings[1];
-    strings[0] = clProgramText;
-    Program = clCreateProgramWithSource(
-        Context, 1, (const char **)strings, NULL, &status);
-    if (status != CL_SUCCESS)
-        fprintf(stderr, "clCreateProgramWithSource failed\n");
-    delete[] clProgramText;
-
-    // Compile and link the Kernel code.
-    const char *options = "";
-    status =
-        clBuildProgram(Program, 1, &Device, options, NULL, NULL);
-    if (status != CL_SUCCESS) {
-        size_t size;
-        clGetProgramBuildInfo(Program, Device,
-                              CL_PROGRAM_BUILD_LOG, 0, NULL,
-                              &size);
-        cl_char *log = new cl_char[size];
-        clGetProgramBuildInfo(Program, Device,
-                              CL_PROGRAM_BUILD_LOG, size, log,
-                              NULL);
-        fprintf(stderr, "clBuildProgram failed:\n%s\n", log);
-        delete[] log;
-    }
-
-    // Create the Kernel object.
-    Kernel = clCreateKernel(Program, "Particle", &status);
-    PrintCLError(status, "clCreateKernel failed: ");
-
-    // Setup the arguments to the Kernel object.
-    status = clSetKernelArg(Kernel, 0, sizeof(cl_mem), &dPobj);
-    PrintCLError(status, "clSetKernelArg (1): ");
-
-    status = clSetKernelArg(Kernel, 1, sizeof(cl_mem), &dVel);
-    PrintCLError(status, "clSetKernelArg (2): ");
-
-    status = clSetKernelArg(Kernel, 2, sizeof(cl_mem), &dCobj);
-    PrintCLError(status, "clSetKernelArg (3): ");
+    // // Enqueue the command to write the data from the host
+    // // buffers to the Device buffers.
+    // status = clEnqueueWriteBuffer(
+    //     CmdQueue, dVel, CL_FALSE, 0,
+    //     4 * sizeof(float) * NUM_PARTICLES, hVel, 0, NULL, NULL);
+    // PrintCLError(status, "clEneueueWriteBuffer: ");
 }
 
 // Initialize the glui window.
@@ -987,6 +976,7 @@ struct errorcode {
     {CL_INVALID_BUFFER_SIZE, "Invalid Buffer Size"},
     {CL_INVALID_MIP_LEVEL, "Invalid MIP Level"},
     {CL_INVALID_GLOBAL_WORK_SIZE, "Invalid Global Work Size"},
+    {CL_INVALID_GL_SHAREGROUP_REFERENCE_KHR, "CL and GL not on the same device (only when using a GPU)."}
 };
 
 void PrintCLError(cl_int errorCode, const char *prefix, FILE *fp) {
